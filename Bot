@@ -1,0 +1,331 @@
+from pybit.unified_trading import WebSocket, HTTP
+import time
+import logging
+import re
+from functools import wraps
+
+# ========== НАСТРОЙКИ ========== #
+logging.basicConfig(
+    filename="arbitrage_bot.log",
+    level=logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    filemode="a"
+)
+
+# Параметры стратегии
+COMMISSION_RATE = 0.0012  # 0.12%
+MIN_PROFIT_RATE = 0.0005  # 0.05%
+SLIPPAGE_BUFFER = 0.0003  # 0.03%
+SPREAD_THRESHOLD = COMMISSION_RATE + SLIPPAGE_BUFFER + MIN_PROFIT_RATE
+MAX_RETRIES = 5
+RECONNECT_DELAY = 7
+
+# API-ключи (ЗАМЕНИТЕ НА СВОИ!)
+API_KEY = "ВАШ_API_КЛЮЧ"
+API_SECRET = "ВАШ_API_СЕКРЕТ"
+
+# Глобальные переменные
+prices = {}
+is_trading = False
+subscribed_topics = set()
+blacklist = set()
+ws_linear = None
+ws_spot = None
+
+# ========== ОСНОВНОЙ КОД ========== #
+session = HTTP(api_key=API_KEY, api_secret=API_SECRET, timeout=15)
+
+def log_message(message, level="info"):
+    logger = getattr(logging, level)
+    logger(message)
+    print(f"[{level.upper()}] {message}")
+
+def retry_on_failure(max_retries):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    log_message(f"Попытка {attempt+1}/{max_retries}: {e}", "error")
+                    time.sleep(1)
+            log_message(f"Функция {func.__name__} не удалась", "error")
+            return None
+        return wrapper
+    return decorator
+
+@retry_on_failure(MAX_RETRIES)
+def get_min_order_qty(symbol, category):
+    try:
+        response = session.get_instruments_info(category=category, symbol=symbol)
+        return float(response["result"]["list"][0]["lotSizeFilter"]["qtyStep"])
+    except Exception as e:
+        log_message(f"Ошибка минимального ордера ({symbol}): {str(e)[:200]}", "error")
+        return None
+
+@retry_on_failure(MAX_RETRIES)
+def place_order_safe(category, symbol, side, qty):
+    try:
+        min_qty = get_min_order_qty(symbol, category)
+        if not min_qty:
+            return None
+            
+        qty = round(qty / min_qty) * min_qty
+        return session.place_order(
+            category=category,
+            symbol=symbol,
+            side=side,
+            orderType="Market",
+            qty=qty
+        )
+    except Exception as e:
+        log_message(f"Ошибка ордера ({symbol}): {str(e)[:200]}", "error")
+        return None
+
+@retry_on_failure(MAX_RETRIES)
+def get_tickers_safe(category):
+    try:
+        if category not in ["spot", "linear"]:
+            raise ValueError(f"Недопустимая категория: {category}")
+            
+        response = session.get_tickers(category=category)
+        return response["result"]["list"]
+    except Exception as e:
+        log_message(f"Ошибка получения тикеров ({category}): {str(e)[:200]}", "error")
+        raise
+
+def handle_message(msg):
+    try:
+        if not isinstance(msg, dict) or "topic" not in msg or "data" not in msg:
+            return
+
+        topic = msg["topic"]
+        data = msg["data"]
+        
+        # Определяем тип рынка
+        if "spot" in topic:
+            price_type = "spot"
+        elif "linear" in topic:
+            price_type = "futures"
+        else:
+            return
+
+        symbol = topic.split(".")[1]
+        
+        # Извлекаем цену
+        price = None
+        try:
+            if price_type == "spot":
+                price = float(data["lastPrice"])
+            else:
+                price = float(data["markPrice"])
+        except KeyError as e:
+            log_message(f"Отсутствует ключ {e} для {symbol}", "warning")
+            return
+
+        # Обновляем и логируем
+        prices.setdefault(symbol, {})[price_type] = price
+        log_message(f"Обновление {price_type} цены {symbol}: {price:.8f}", "debug")
+        
+        # Проверяем арбитраж при наличии обеих цен
+        if all(k in prices[symbol] for k in ["spot", "futures"]):
+            check_arbitrage(symbol)
+
+    except Exception as e:
+        log_message(f"Ошибка обработки сообщения: {str(e)[:200]}", "error")
+
+def check_arbitrage(symbol):
+    global is_trading
+    if is_trading:
+        return
+
+    try:
+        entry = prices[symbol]
+        spot = entry["spot"]
+        futures = entry["futures"]
+        
+        spread = ((futures - spot) / spot) * 100
+        effective_spread = abs(spread) - (COMMISSION_RATE*2 + SLIPPAGE_BUFFER)*100
+
+        log_message(
+            f"Арбитраж {symbol}:\n"
+            f"SPOT: {spot:.8f}\n"
+            f"FUTURES: {futures:.8f}\n"
+            f"Спред: {spread:.4f}%\n"
+            f"Эффективный спред: {effective_spread:.4f}%\n"
+            f"Порог: {SPREAD_THRESHOLD*100:.4f}%",
+            "info"
+        )
+
+        if effective_spread > SPREAD_THRESHOLD * 100:
+            execute_arbitrage(symbol, spread)
+
+    except Exception as e:
+        log_message(f"Ошибка анализа арбитража: {str(e)[:200]}", "error")
+
+def execute_arbitrage(symbol, spread):
+    global is_trading
+    is_trading = True
+    try:
+        amount = calculate_trade_amount(symbol)
+        if not amount or not check_balance(symbol, amount):
+            return
+
+        # Логика сделки
+        if spread > 0:
+            log_message(f"Покупка SPOT {symbol}...", "info")
+            place_order_safe("spot", symbol, "Buy", amount)
+            log_message(f"Продажа FUTURES {symbol}...", "info")
+            place_order_safe("linear", symbol, "Sell", amount)
+        else:
+            log_message(f"Покупка FUTURES {symbol}...", "info")
+            place_order_safe("linear", symbol, "Buy", amount)
+            log_message(f"Продажа SPOT {symbol}...", "info")
+            place_order_safe("spot", symbol, "Sell", amount)
+
+    except Exception as e:
+        log_message(f"Ошибка сделки: {str(e)[:200]}", "error")
+    finally:
+        is_trading = False
+
+def calculate_trade_amount(symbol):
+    try:
+        balance = get_available_balance()
+        if balance <= 0:
+            log_message("Баланс равен нулю", "error")
+            return None
+            
+        ticker = session.get_tickers(category="spot", symbol=symbol)
+        price = float(ticker["result"]["list"][0]["lastPrice"])
+        min_qty = get_min_order_qty(symbol, "spot")
+        
+        if not min_qty:
+            return None
+            
+        return max(min_qty, balance / price)
+    except Exception as e:
+        log_message(f"Ошибка расчета объема: {str(e)[:200]}", "error")
+        return None
+
+def get_available_balance():
+    try:
+        balance = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        return float(balance["result"]["list"][0]["coin"][0]["walletBalance"])
+    except Exception as e:
+        log_message(f"Ошибка баланса: {str(e)[:200]}", "error")
+        return 0
+
+def check_balance(symbol, amount):
+    try:
+        price = session.get_tickers(category="spot", symbol=symbol)
+        price = float(price["result"]["list"][0]["lastPrice"])
+        return get_available_balance() >= price * amount
+    except Exception as e:
+        log_message(f"Ошибка проверки баланса: {str(e)[:200]}", "error")
+        return False
+
+def is_liquid(symbol):
+    try:
+        volume = session.get_tickers(category="spot", symbol=symbol)
+        volume = float(volume["result"]["list"][0]["volume24h"])
+        return volume > 1_000_000
+    except Exception as e:
+        log_message(f"Ошибка ликвидности: {str(e)[:200]}", "error")
+        return False
+
+def init_websocket():
+    global ws_linear, ws_spot
+    try:
+        # Подключение для фьючерсов
+        ws_linear = WebSocket(
+            testnet=False,  # Для тестовой сети укажите True
+            api_key=API_KEY,
+            api_secret=API_SECRET,
+            channel_type="linear",
+            callback_function=handle_message
+        )
+        
+        # Подключение для спота
+        ws_spot = WebSocket(
+            testnet=False,
+            api_key=API_KEY,
+            api_secret=API_SECRET,
+            channel_type="spot",
+            callback_function=handle_message
+        )
+        
+        log_message("WebSocket подключения установлены", "info")
+        
+    except Exception as e:
+        log_message(f"Критическая ошибка WebSocket: {str(e)[:200]}", "critical")
+        raise
+
+def subscribe_to_symbols(symbols):
+    global subscribed_topics
+    for symbol in symbols:
+        # Проверка формата символа
+        if not re.fullmatch(r"^[A-Z]{3,10}USDT$", symbol):
+            log_message(f"Некорректный символ: {symbol}", "warning")
+            continue
+            
+        if symbol in blacklist or not is_liquid(symbol):
+            continue
+
+        # Подписка на оба рынка
+        for category in ["spot", "linear"]:
+            topic = f"tickers.{symbol}.{category}"
+            if topic in subscribed_topics:
+                continue
+                
+            try:
+                if category == "spot":
+                    ws_spot.ticker_stream(symbol=symbol, callback=handle_message)  # Исправлено
+                else:
+                    ws_linear.ticker_stream(symbol=symbol, callback=handle_message)  # Исправлено
+                    
+                subscribed_topics.add(topic)
+                log_message(f"Успешная подписка на {topic}", "debug")
+            except Exception as e:
+                if "already subscribed" in str(e):
+                    subscribed_topics.add(topic)
+                else:
+                    log_message(f"Ошибка подписки на {topic}: {str(e)[:200]}", "error")
+
+def main_loop():
+    while True:
+        try:
+            # Получаем активные пары
+            spot = [
+                s["symbol"] 
+                for s in get_tickers_safe("spot") 
+                if re.fullmatch(r"^[A-Z]{3,10}USDT$", s["symbol"])
+            ]
+            futures = [
+                s["symbol"] 
+                for s in get_tickers_safe("linear") 
+                if re.fullmatch(r"^[A-Z]{3,10}USDT$", s["symbol"])
+            ]
+            common = list(set(spot) & set(futures))
+            
+            log_message(f"Найдено активных пар: {len(common)}", "info")
+            subscribe_to_symbols(common)
+            
+            time.sleep(30)  # Проверка каждые 30 секунд
+            
+        except Exception as e:
+            log_message(f"Ошибка main_loop: {str(e)[:200]}", "error")
+            time.sleep(10)
+
+if __name__ == "__main__":
+    try:
+        init_websocket()
+        main_loop()
+    except KeyboardInterrupt:
+        log_message("Остановлено пользователем", "warning")
+    finally:
+        if ws_linear:
+            ws_linear.exit()
+        if ws_spot:
+            ws_spot.exit()
+        log_message("Работа завершена", "info")
